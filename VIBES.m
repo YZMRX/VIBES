@@ -5,24 +5,11 @@
 %
 %       Y = F * X + A * Z + E.
 %
-%   Source rows use voxel-wise ARD precisions.  The structured-noise
-%   factors A and Z share component-wise ARD precisions, so unnecessary
-%   candidate components are suppressed without fixing the final rank.
-%   E is isotropic Gaussian residual noise with a learned precision.
 %
 %   Required inputs
 %     y                 [n_channel x n_time] sensor data
 %     f                 [n_channel x (nd*n_voxel)] lead field
 %
-%   The test configuration uses the fixed CPU path with a two-pass
-%   augmented-ARD initialization, Cholesky residual factors, diagonal
-%   residual noise precision, and posterior structured-noise uncertainty.
-%
-%   MODEL fields include noise_est, residual, and iterations.
-%
-%   Notes
-%   -----
-%   1. No explicit source/noise orthogonality constraint is imposed.
 eps1       = 1e-10;
 jitter     = 1e-9;
 nd         = opts.nd;
@@ -36,11 +23,8 @@ nt = size(y, 2);
 
 nv = nvd / nd;
 
-% Main VB uses max_iter as an upper bound and stops when the ELBO stabilizes.
-% The two-pass initializer uses a fixed internal iteration count.
 init_champ_tol = max(sqrt(tol), 1e-4);
 
-% Cholesky initialization retains the full sensor covariance; component ARD
 % selects the effective rank during the VB iterations.
 nm = nk;
 y_work = double(y);
@@ -62,9 +46,6 @@ eye_c = eye(nk, 'like', y_work);
 eye_m = eye(nm, 'like', y_work);
 log2pi = log(2 * pi);
 
-% ---------------------------------------------------------------------
-% Two-pass warm start: augmented ARD followed by residual covariance ARD.
-% ---------------------------------------------------------------------
 cyy0 = y_work * y_work' / nt;
 sensor_power0 = max(real(trace(cyy0)) / nk, eps1);
 lf_n = reshape(repmat(eye_c, nd, 1), nk, nk * nd);
