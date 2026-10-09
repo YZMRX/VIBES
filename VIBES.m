@@ -10,10 +10,6 @@
 %   candidate components are suppressed without fixing the final rank.
 %   E is isotropic Gaussian residual noise with a learned precision.
 %
-%   This is the first, single-window implementation.  Temporal windowing
-%   and AR state propagation should be implemented by a wrapper after this
-%   core update has been validated.
-%
 %   Required inputs
 %     y                 [n_channel x n_time] sensor data
 %     f                 [n_channel x (nd*n_voxel)] lead field
