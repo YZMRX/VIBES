@@ -1,5 +1,4 @@
 ﻿function [gamma, x, w, c, v, model] = VIBES(y, f, opts)
-%AWSM_HVB_CHAMP_GPU Single-window hierarchical VB Champagne prototype.
 %
 %   [GAMMA, X, W, C, V, MODEL] = AWSM_HVB_CHAMP_GPU(Y, F, OPTS)
 %   jointly estimates sparse sources and structured sensor noise under
