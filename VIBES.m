@@ -1,36 +1,39 @@
-﻿function [gamma, x, w, c, v, model] = VIBES(y, f, opts)
-%   jointly estimates sparse sources and structured sensor noise under
+function [gamma, x, w, c, v, model] = VIBES(y, f, opts)
+%VIBES Source reconstruction with structured sensor noise.
+%   Model: Y = F * X + A * Z + E, with diagonal residual covariance.
 %
-%       Y = F * X + A * Z + E.
+%   Y: [num_channels x num_samples] sensor data.
+%   F: [num_channels x (nd*num_voxels)] leadfield.
+%   OPTS: nd, max_iter.
 %
-%
-%   Required inputs
-%     y                 [n_channel x n_time] sensor data
-%     f                 [n_channel x (nd*n_voxel)] lead field
-%
+%   GAMMA: [nd x nd x num_voxels] ARD source covariance blocks.
+%   X: estimated source time courses in the input leadfield scale.
+%   W: source filter, with X = W * (Y - MODEL.noise_est).
+%   C: total model covariance in sensor space.
+%   V: trace of each GAMMA block.
+%   MODEL: noise_est, residual, iterations.
+
 eps1       = 1e-10;
 jitter     = 1e-9;
 nd         = opts.nd;
 max_iter   = opts.max_iter;
 tol        = 1e-8;
-init_champ_iter = 20;
-iteration_plot_on = opts.iteration_plot_on;
+init_ard_iter = 20;
+iteration_plot_on = true;
 
 [nk, nvd] = size(f);
 nt = size(y, 2);
 
 nv = nvd / nd;
 
-init_champ_tol = max(sqrt(tol), 1e-4);
+% ARD initialization tolerance.
+init_ard_tol = max(sqrt(tol), 1e-4);
 
-% selects the effective rank during the VB iterations.
+% Number of candidate noise components.
 nm = nk;
 y_work = double(y);
 f_work = double(f);
-% Per-voxel-group leadfield column normalization.
-% Without this, shallow high-gain sources dominate and deep sources are
-% suppressed by ARD.  Working on F_tilde = F_v / s_v makes the model
-% scale-invariant; outputs are restored to physical units at the end.
+% Normalize voxel leadfield blocks.
 fv_norm = zeros(nv, 1, 'like', y_work);
 for iv = 1:nv
     cols = (iv - 1) * nd + (1:nd);
@@ -43,118 +46,117 @@ f_work = f_work ./ fv_norm_vec';
 eye_c = eye(nk, 'like', y_work);
 eye_m = eye(nm, 'like', y_work);
 log2pi = log(2 * pi);
-
+% Two-stage ARD initialization.
 cyy0 = y_work * y_work' / nt;
 sensor_power0 = max(real(trace(cyy0)) / nk, eps1);
 lf_n = reshape(repmat(eye_c, nd, 1), nk, nk * nd);
-    f_init = [f_work, lf_n];
-    nvd_init = size(f_init, 2);
-    nv_init = nvd_init / nd;
+f_init = [f_work, lf_n];
+nvd_init = size(f_init, 2);
+nv_init = nvd_init / nd;
 
-    f2_init = sum(abs(f_init).^2, 1);
-    invf2_init = zeros(1, nvd_init, 'like', y_work);
-    valid_f_init = f2_init > eps1;
-    invf2_init(valid_f_init) = 1 ./ f2_init(valid_f_init);
-    w0_init = f_init' .* invf2_init';
-    x0_init = w0_init * y_work;
-    inu0 = max(mean(abs(x0_init).^2, 'all'), eps1);
-    vvec_init = inu0 * ones(nvd_init, 1, 'like', y_work);
+f2_init = sum(abs(f_init).^2, 1);
+invf2_init = zeros(1, nvd_init, 'like', y_work);
+valid_f_init = f2_init > eps1;
+invf2_init(valid_f_init) = 1 ./ f2_init(valid_f_init);
+w0_init = f_init' .* invf2_init';
+x0_init = w0_init * y_work;
+inu0 = max(mean(abs(x0_init).^2, 'all'), eps1);
+vvec_init = inu0 * ones(nvd_init, 1, 'like', y_work);
 
-    init_stall_count = 0;
-    for init_iter = 1:init_champ_iter
-        vvec_previous = vvec_init;
-        c_init = (f_init .* vvec_init') * f_init';
-        [rinv_y0, ~, L_c] = local_spd_solve(c_init, y_work, jitter);
-        rinv_f0 = L_c' \ (L_c \ f_init);
-        x0_init = vvec_init .* (f_init' * rinv_y0);
-        x20_init = mean(abs(x0_init).^2, 2);
-        zdiag0 = max(real(sum(conj(f_init) .* rinv_f0, 1)'), eps1);
+init_stall_count = 0;
+for init_iter = 1:init_ard_iter
+    vvec_previous = vvec_init;
+    c_init = (f_init .* vvec_init') * f_init';
+    [rinv_y0, ~, L_c] = local_spd_solve(c_init, y_work, jitter);
+    rinv_f0 = L_c' \ (L_c \ f_init);
+    x0_init = vvec_init .* (f_init' * rinv_y0);
+    x20_init = mean(abs(x0_init).^2, 2);
+    zdiag0 = max(real(sum(conj(f_init) .* rinv_f0, 1)'), eps1);
 
-        x2_group0 = sum(reshape(x20_init, nd, nv_init), 1);
-        z_group0 = sum(reshape(zdiag0, nd, nv_init), 1);
-        v_group0 = sqrt(max(x2_group0 ./ max(z_group0, eps1), 0));
-        vvec_init = reshape(ones(nd, 1, 'like', y_work) * v_group0, nvd_init, 1);
+    x2_group0 = sum(reshape(x20_init, nd, nv_init), 1);
+    z_group0 = sum(reshape(zdiag0, nd, nv_init), 1);
+    v_group0 = sqrt(max(x2_group0 ./ max(z_group0, eps1), 0));
+    vvec_init = reshape(ones(nd, 1, 'like', y_work) * v_group0, nvd_init, 1);
 
-        init_change = norm(vvec_init - vvec_previous) / ...
-            max(norm(vvec_previous), eps1);
-        if init_change < init_champ_tol
-            init_stall_count = init_stall_count + 1;
-        else
-            init_stall_count = 0;
-        end
-        if init_stall_count >= 3
-            break
-        end
+    init_change = norm(vvec_init - vvec_previous) / ...
+        max(norm(vvec_previous), eps1);
+    if init_change < init_ard_tol
+        init_stall_count = init_stall_count + 1;
+    else
+        init_stall_count = 0;
     end
+    if init_stall_count >= 3
+        break
+    end
+end
 
-    x0 = x0_init(1:nvd, :);
+x0 = x0_init(1:nvd, :);
 
-    residual_1st = y_work - f_work * x0;
-        C_R = residual_1st * residual_1st' / nt;
-        C_R = 0.5 * (C_R + C_R');
-        [U_R, D_R] = eig(C_R);
-        d_R = sort(max(real(diag(D_R)), 0), 'ascend');
-        tail_count = max(floor(nk / 2), 1);
-        sigma2_0 = median(d_R(1:tail_count));
-        s_struct = max(d_R - sigma2_0, eps1);
-        [~, idx_struct] = sort(s_struct, 'descend');
-        nB_raw = min(nm, nnz(s_struct > 1e-3 * max(s_struct)));
-        if nB_raw > 0
-            nB = nd * ceil(nB_raw / nd);
-        else
-            nB = 0;
-        end
-        B = U_R(:, idx_struct(1:nB_raw));
-        if nB > nB_raw
-            B = [B, zeros(nk, nB - nB_raw, 'like', y_work)];
-        end
+residual_1st = y_work - f_work * x0;
+C_R = residual_1st * residual_1st' / nt;
+C_R = 0.5 * (C_R + C_R');
+[U_R, D_R] = eig(C_R);
+d_R = sort(max(real(diag(D_R)), 0), 'ascend');
+tail_count = max(floor(nk / 2), 1);
+sigma2_0 = median(d_R(1:tail_count));
+s_struct = max(d_R - sigma2_0, eps1);
+[~, idx_struct] = sort(s_struct, 'descend');
+nB_raw = min(nm, nnz(s_struct > 1e-3 * max(s_struct)));
+if nB_raw > 0
+    nB = nd * ceil(nB_raw / nd);
+else
+    nB = 0;
+end
+B = U_R(:, idx_struct(1:nB_raw));
+if nB > nB_raw
+    B = [B, zeros(nk, nB - nB_raw, 'like', y_work)];
+end
 
-        f_init2 = [f_work, B];
-        nvd_init2 = size(f_init2, 2);
-        f2_in2 = sum(abs(f_init2).^2, 1);
-        invf2_in2 = zeros(1, nvd_init2, 'like', y_work);
-        valid_f2 = f2_in2 > eps1;
-        invf2_in2(valid_f2) = 1 ./ f2_in2(valid_f2);
-        w0_in2 = f_init2' .* invf2_in2';
-        x0_in2 = w0_in2 * y_work;
-        inu_2 = max(mean(abs(x0_in2).^2, 'all'), eps1);
-        vvec_in2 = inu_2 * ones(nvd_init2, 1, 'like', y_work);
+f_init2 = [f_work, B];
+nvd_init2 = size(f_init2, 2);
+f2_in2 = sum(abs(f_init2).^2, 1);
+invf2_in2 = zeros(1, nvd_init2, 'like', y_work);
+valid_f2 = f2_in2 > eps1;
+invf2_in2(valid_f2) = 1 ./ f2_in2(valid_f2);
+w0_in2 = f_init2' .* invf2_in2';
+x0_in2 = w0_in2 * y_work;
+inu_2 = max(mean(abs(x0_in2).^2, 'all'), eps1);
+vvec_in2 = inu_2 * ones(nvd_init2, 1, 'like', y_work);
 
+init2_stall_count = 0;
+for init_iter = 1:init_ard_iter
+    vvec_previous = vvec_in2;
+    c_in2 = (f_init2 .* vvec_in2') * f_init2';
+    [rinv_y2, ~, L_c2] = local_spd_solve(c_in2, y_work, jitter);
+    rinv_f2 = L_c2' \ (L_c2 \ f_init2);
+    x0_in2 = vvec_in2 .* (f_init2' * rinv_y2);
+    x20_in2 = mean(abs(x0_in2).^2, 2);
+    zdiag_in2 = max(real(sum(conj(f_init2) .* rinv_f2, 1)'), eps1);
+    x2g_in2 = sum(reshape(x20_in2, nd, nvd_init2/nd), 1);
+    zg_in2 = sum(reshape(zdiag_in2, nd, nvd_init2/nd), 1);
+    vg_in2 = sqrt(max(x2g_in2 ./ max(zg_in2, eps1), 0));
+    vvec_in2 = reshape(ones(nd, 1, 'like', y_work) * vg_in2, nvd_init2, 1);
+
+    init_change = norm(vvec_in2 - vvec_previous) / ...
+        max(norm(vvec_previous), eps1);
+    if init_change < init_ard_tol
+        init2_stall_count = init2_stall_count + 1;
+    else
         init2_stall_count = 0;
-        for init_iter = 1:init_champ_iter
-            vvec_previous = vvec_in2;
-            c_in2 = (f_init2 .* vvec_in2') * f_init2';
-            [rinv_y2, ~, L_c2] = local_spd_solve(c_in2, y_work, jitter);
-            rinv_f2 = L_c2' \ (L_c2 \ f_init2);
-            x0_in2 = vvec_in2 .* (f_init2' * rinv_y2);
-            x20_in2 = mean(abs(x0_in2).^2, 2);
-            zdiag_in2 = max(real(sum(conj(f_init2) .* rinv_f2, 1)'), eps1);
-            x2g_in2 = sum(reshape(x20_in2, nd, nvd_init2/nd), 1);
-            zg_in2 = sum(reshape(zdiag_in2, nd, nvd_init2/nd), 1);
-            vg_in2 = sqrt(max(x2g_in2 ./ max(zg_in2, eps1), 0));
-            vvec_in2 = reshape(ones(nd, 1, 'like', y_work) * vg_in2, nvd_init2, 1);
+    end
+    if init2_stall_count >= 3
+        break
+    end
+end
 
-            init_change = norm(vvec_in2 - vvec_previous) / ...
-                max(norm(vvec_previous), eps1);
-        if init_change < init_champ_tol
-                init2_stall_count = init2_stall_count + 1;
-            else
-                init2_stall_count = 0;
-            end
-            if init2_stall_count >= 3
-                break
-            end
-        end
-
-        x0 = x0_in2(1:nvd, :);
-        v_group0 = mean(reshape(vvec_in2(1:nvd), nd, nv), 1)';
-        noise_factor_two_pass = B * x0_in2(nvd+1:end, :);
+x0 = x0_in2(1:nvd, :);
+v_group0 = mean(reshape(vvec_in2(1:nvd), nd, nv), 1)';
+noise_factor_two_pass = B * x0_in2(nvd+1:end, :);
 alpha = 1 ./ max(v_group0, eps1);
 x_work = x0;
 residual0 = y_work - f_work * x_work;
 
-% Estimate the initial white-noise precision from the lower half of the
-% residual covariance spectrum; dominant structured modes stay in A*Z.
+% Initialize channel residual precisions.
 residual_cov0 = residual0 * residual0' / nt;
 residual_eigs0 = sort(max(real(eig(0.5 * ...
     (residual_cov0 + residual_cov0'))), 0), 'ascend');
@@ -164,13 +166,12 @@ residual_var0 = mean(abs(residual0).^2, 2);
 residual_var0 = 0.5 * residual_var0 + 0.5 * white_var0;
 tau_vec = 1 ./ max(residual_var0, sensor_power0 * eps1);
 
-% Initialize A*Z from the source residual without discarding sensor modes.
+% Initialize noise factors.
 noise_factor_init = noise_factor_two_pass;
 [a_work, z_work] = local_initialize_noise_factors( ...
     noise_factor_init, eps1, jitter);
 
-% Start the covariance corrections at zero; using identity matrices here
-% would add nk/nt pseudo-observations and collapse the residual factor initialization.
+% Initialize factor posterior covariances.
 sigma_a_stack = zeros(nm, nm, nk, 'like', y_work);
 sigma_z = zeros(nm, nm, 'like', y_work);
 a_energy = sum(abs(a_work).^2, 1)';
@@ -187,9 +188,7 @@ else
 end
 
 for iter = 1:max_iter
-    % ================================================================
-    % q(X): source posterior conditioned on the current VB noise factors.
-    % ================================================================
+    % Update the source posterior and ARD precisions.
     noise_mean = a_work * z_work;
     y_clean = y_work - noise_mean;
     alpha_vec = reshape(ones(nd, 1, 'like', alpha) * alpha', [], 1);
@@ -218,9 +217,7 @@ for iter = 1:max_iter
     alpha_shape = 1e-6 + nd * nt / 2;
     alpha_rate = 1e-6 + 0.5 * source_second_moment;
     alpha = alpha_shape ./ max(alpha_rate, eps1);
-    % ================================================================
-    % q(Z): structured-noise temporal coefficients.
-    % ================================================================
+    % Update temporal noise factors.
     source_residual = y_work - f_work * x_work;
     weighted_a = bsxfun(@times, a_work, tau_vec);
     expected_a_t_a = a_work' * weighted_a;
@@ -230,9 +227,7 @@ for iter = 1:max_iter
         local_spd_solve(precision_z, eye_m, jitter);
     z_work = sigma_z * (a_work' * bsxfun(@times, source_residual, tau_vec));
     expected_zzt = z_work * z_work' + nt * sigma_z;
-    % ================================================================
-    % q(A): structured-noise spatial basis.
-    % ================================================================
+    % Update spatial noise factors.
     sigma_a_stack = zeros(nm, nm, nk, 'like', y_work);
     a_work_new = zeros(nk, nm, 'like', y_work);
     a_energy = zeros(nm, 1, 'like', y_work);
@@ -243,11 +238,7 @@ for iter = 1:max_iter
         [L, p] = chol(P, 'lower');
         if p > 0
             P = P + (jitter * max(real(trace(P)), 1) / nm) * eye_m;
-            [L, p] = chol(P, 'lower');
-            if p > 0
-                error('awsm_hvb_champ_gpu:NotPositiveDefinite', ...
-                    'Per-channel precision remained indefinite.');
-            end
+            L = chol(P, 'lower');
         end
         sigma_a_ic = L' \ (L \ eye_m);
         sigma_a_stack(:, :, ic) = sigma_a_ic;
@@ -259,14 +250,7 @@ for iter = 1:max_iter
             - 2 * sum(log(max(real(diag(L)), eps1)));
     end
     a_work = a_work_new;
-    % ================================================================
-    % Symmetric Gauss--Seidel q(Z) back sweep.
-    %
-    % The forward q(Z)->q(A) pass leaves Z conditioned on the previous A.
-    % Recomputing its conjugate posterior after q(A) makes the structured
-    % noise A*Z used by the next source step consistent with the latest
-    % spatial factor.  This is a second exact coordinate update of the
-    % same ELBO, with no added prior, tuning parameter, or data change.
+    % Refresh temporal factors.
     weighted_a = bsxfun(@times, a_work, tau_vec);
     expected_a_t_a = a_work' * weighted_a;
     sum_tau_sigma_a = sum(bsxfun(@times, sigma_a_stack, ...
@@ -278,14 +262,11 @@ for iter = 1:max_iter
     expected_zzt = z_work * z_work' + nt * sigma_z;
     z_energy = real(diag(expected_zzt));
 
-    % Shared component precision removes the A/Z scale ambiguity and
-    % suppresses redundant candidate noise components.
+    % Update shared noise-component precisions.
     lambda_shape = 1e-6 + (nk + nt) / 2;
     lambda_rate = 1e-6 + 0.5 * (a_energy + z_energy);
     lambda = lambda_shape ./ max(lambda_rate, eps1);
-    % ================================================================
-    % q(tau): residual white-noise precision with uncertainty corrections.
-    % ================================================================
+    % Update channel residual precisions.
     noise_mean = a_work * z_work;
     mean_residual = y_work - f_work * x_work - noise_mean;
 
@@ -306,10 +287,7 @@ for iter = 1:max_iter
     tau_rate = 1e-6 + 0.5 * expected_residual;
     tau_vec = tau_shape ./ max(tau_rate, eps1);
     tau = mean(tau_vec);
-
-    % ================================================================
-    % Uncertainty-aware variational objective for fixed-iteration monitoring.
-    % ================================================================
+    % Compute the variational objective.
     tau_for_elbo = tau_vec;
     logdet_sigma_s = sum(log(max(dsrc, eps1))) ...
         + logdet_noise_cov - logdet_r;
@@ -382,8 +360,7 @@ end
 
 n_iter = iter;
 
-% Recompute all public outputs from the final hyperparameters.  This avoids
-% the stale-W/X issue in the original GPU implementation.
+% Final source estimates.
 alpha_vec = reshape(ones(nd, 1, 'like', alpha) * alpha', [], 1);
 dsrc = 1 ./ max(alpha_vec, eps1);
 noise_mean = a_work * z_work;
@@ -392,8 +369,7 @@ b_source = (f_work .* dsrc') * f_work';
     local_noise_covariance_moments(a_work, z_work, sigma_z, ...
     sigma_a_stack, nt);
 residual_noise_cov = diag(1 ./ max(tau_vec, eps1));
-% The public source filter is the conditional variational mean associated
-% with the final q(A)q(Z) coordinate solution.
+% Combine structured-noise uncertainty and residual covariance.
 noise_cov_for_source = structured_noise_uncertainty_cov + residual_noise_cov;
 source_cov_work = b_source;
 r_source = b_source + noise_cov_for_source;
@@ -404,10 +380,10 @@ x_work = dsrc .* (f_work' * rinv_clean);
 
 v_group = 1 ./ max(alpha, eps1);
 
-% Restore physical units: F = F_tilde .* s  =>  X = X_tilde ./ s
+% Restore the input leadfield scale.
 x_work = x_work ./ fv_norm_vec;
 w_work = w_work ./ fv_norm_vec;
-v_group = v_group ./ max(fv_norm.^2, eps1);
+v_group = v_group ./ fv_norm.^2;
 
 v = (nd * v_group)';
 x = x_work;
@@ -436,10 +412,6 @@ model.iterations = n_iter;
 
 end
 
-% =====================================================================
-% Local utilities
-% =====================================================================
-
 function [a_init, z_init] = local_initialize_noise_factors( ...
     residual, eps1, jitter)
 [nk, nt] = size(residual);
@@ -448,25 +420,13 @@ residual_cov = residual * residual' / nt;
 residual_cov = 0.5 * (residual_cov + residual_cov');
 cov_scale = max(real(trace(residual_cov)) / nk, eps1);
 eye_c = eye(nk, 'like', residual);
-ridge0 = jitter * cov_scale;
-for attempt = 0:7
-    ridge = (10^attempt) * ridge0;
-    [a_init, p] = chol(residual_cov + ridge * eye_c, 'lower');
-    if p == 0
-        break
-    end
-end
-if p ~= 0
-    error('awsm_hvb_champ_gpu:CholeskyInitFailed', ...
-        'Residual covariance could not be regularized for Cholesky initialization.');
-end
+a_init = chol(residual_cov + jitter * cov_scale * eye_c, 'lower');
 z_init = a_init \ residual;
 [a_init, z_init] = local_balance_noise_factors(a_init, z_init, eps1);
 end
 
-
 function [a_factor, z_factor] = local_balance_noise_factors(a_factor, z_factor, eps1)
-% Balance A/Z column-row energies while preserving their product exactly.
+% Balance spatial and temporal factor energies.
 a_norm = sqrt(sum(abs(a_factor).^2, 1))';
 z_norm = sqrt(sum(abs(z_factor).^2, 2));
 scale = sqrt(max(z_norm, eps1) ./ max(a_norm, eps1));
@@ -474,16 +434,14 @@ a_factor = a_factor .* scale';
 z_factor = z_factor ./ scale;
 end
 
-
 function [structured_cov, uncertainty_cov] = local_noise_covariance_moments( ...
     a_mean, z_mean, sigma_z, sigma_a_stack, nt)
-% Expected sensor covariance of A*Z, split into mean and posterior variance.
+% Compute structured-noise covariance and posterior uncertainty.
 mean_noise = a_mean * z_mean;
 mean_cov = mean_noise * mean_noise' / nt;
 z_second_moment = z_mean * z_mean' / nt + sigma_z;
 
-% q(Z) contributes full sensor covariance; independent q(A_i) rows add
-% only sensor-wise uncertainty, which belongs on the diagonal.
+% Combine temporal-factor and spatial-factor uncertainty.
 uncertainty_cov = a_mean * sigma_z * a_mean';
 nk = size(a_mean, 1);
 a_uncertainty_var = real(sum(sum(bsxfun(@times, sigma_a_stack, ...
@@ -496,36 +454,17 @@ structured_cov = mean_cov + uncertainty_cov;
 structured_cov = 0.5 * (structured_cov + structured_cov');
 end
 
-
 function [solution, logdet_a, L] = local_spd_solve(a, b, jitter)
 a = 0.5 * (a + a');
-n = size(a, 1);
-scale = max(real(trace(a)) / max(n, 1), 1);
-eye_n = eye(n, 'like', a);
-
-for attempt = 0:7
-    if attempt == 0
-        a_try = a;
-    else
-        a_try = a + (10^(attempt - 1) * jitter * scale) * eye_n;
-    end
-    [lower_a, p] = chol(a_try, 'lower');
-    if p == 0
-        solution = lower_a' \ (lower_a \ b);
-        logdet_a = 2 * sum(log(real(diag(lower_a))));
-        if nargout > 2
-            L = lower_a;
-        end
-        return
-    end
+[L, p] = chol(a, 'lower');
+if p > 0
+    n = size(a, 1);
+    scale = max(real(trace(a)) / n, 1);
+    L = chol(a + jitter * scale * eye(n, 'like', a), 'lower');
 end
-
-error('awsm_hvb_champ_gpu:NotPositiveDefinite', ...
-    'A posterior precision matrix remained indefinite after jittering.');
+solution = L' \ (L \ b);
+logdet_a = 2 * sum(log(real(diag(L))));
 end
-
-
-
 
 function plot_state = local_init_iteration_plot(max_iter, num_voxels)
 fig = figure('Color', 'w', 'Name', 'VIBES iterations', ...
@@ -559,7 +498,6 @@ plot_state.voxel_power = plot(ax_energy, 1:num_voxels, zeros(num_voxels, 1), ...
 drawnow;
 end
 
-
 function local_update_iteration_plot(plot_state, iter, elbo_value, ...
     voxel_power)
 if ~isgraphics(plot_state.fig)
@@ -568,11 +506,7 @@ end
 
 addpoints(plot_state.elbo, iter, elbo_value);
 voxel_power = real(double(voxel_power(:)));
-voxel_power(~isfinite(voxel_power) | voxel_power < 0) = 0;
-maximum_power = max(voxel_power);
-if maximum_power > 0
-    voxel_power = voxel_power / maximum_power;
-end
+voxel_power = voxel_power / max(voxel_power);
 set(plot_state.voxel_power, 'YData', voxel_power);
 drawnow limitrate;
 end
